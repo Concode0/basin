@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: basin
+Version: 0.3.0
+Summary: A deterministic sandbox for decentralized scheduling with delayed gossip
+Requires-Python: >=3.10
+Requires-Dist: matplotlib>=3.7

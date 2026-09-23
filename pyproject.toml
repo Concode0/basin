@@ -1,11 +1,13 @@
 [project]
 name = "basin"
-version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.13"
-dependencies = [
-    "matplotlib>=3.11.0",
-    "numpy>=2.5.0",
-    "pillow>=12.2.0",
-    "scipy>=1.18.0",
-]
+version = "0.3.0"
+requires-python = ">=3.10"
+description = "A deterministic sandbox for decentralized scheduling with delayed gossip"
+dependencies = ["matplotlib>=3.7"]
+
+[project.scripts]
+basin = "basin.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

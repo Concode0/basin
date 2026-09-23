@@ -1,0 +1,2 @@
+[console_scripts]
+basin = basin.__main__:main
