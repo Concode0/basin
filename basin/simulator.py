@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field, replace
 from random import Random
 from types import MappingProxyType
 from .model import Accept, BeliefRecord, Forward, Hold, LocalView, Node, Task
-from .rule import BasinRule, Rule
+from .rule import BasinRule, Rule, quadratic_gain
 from .scenario import Scenario
 
 @dataclass
@@ -46,7 +46,7 @@ class Simulator:
     def __init__(self, scenario: Scenario, rule: Rule | None = None):
         self._validate(scenario)
         self.scenario = scenario
-        self.rule = rule if rule is not None else BasinRule(scenario.max_hops, scenario.hysteresis)
+        self.rule = rule if rule is not None else BasinRule(scenario.max_hops)
         self.rng = Random(scenario.seed)
         self._nodes = {n.id: _NodeState(n) for n in sorted(scenario.nodes, key=lambda n: n.id)}
         self._tasks: dict[str, Task] = {}
@@ -54,6 +54,7 @@ class Simulator:
         self._gossip_messages: list[GossipMessage] = []
         self.tick_index = 0
         self._next_task = 0
+        self._forward_count = 0
         self._decisions: list[dict] = []
         for state in self._nodes.values():
             self._report(state, -1)
@@ -70,11 +71,12 @@ class Simulator:
             raise ValueError("topology must be undirected")
         w = s.workload
         if (s.gossip_delay < 2 or s.task_hop_delay < 2 or s.gossip_period < 1
-            or s.max_hops < 0 or s.hysteresis < 0 or not 0 <= s.packet_loss <= 1
+            or s.max_hops < 0 or not 0 <= s.packet_loss <= 1
             or w.arrival_attempts < 0 or not 0 <= w.arrival_probability <= 1
             or w.compute_work_range[0] <= 0 or w.compute_work_range[1] < w.compute_work_range[0]
             or w.memory_required_range[0] <= 0 or w.memory_required_range[1] < w.memory_required_range[0]
-            or w.memory_required_range[0] > max(n.memory_capacity for n in s.nodes)):
+            or any(w.memory_required_range[0] > max([n.memory_capacity] +
+                   [nodes[peer].memory_capacity for peer in n.neighbors]) for n in s.nodes)):
             raise ValueError("invalid simulation configuration")
 
     def _remaining(self, state: _NodeState) -> float:
@@ -90,16 +92,15 @@ class Simulator:
     def local_view(self, node_id: str, task_id: str | None = None) -> LocalView:
         state = self._nodes[node_id]
         own = state.belief[node_id]
-        # The candidate task already sits in the local pending queue. Avoid counting it twice.
         if task_id is not None:
             if task_id not in state.pending:
                 raise ValueError("task is not pending locally")
-            own = replace(own, known_remaining_work=own.known_remaining_work - self._tasks[task_id].remaining_work)
         return LocalView(node_id, own, state.hardware.neighbors,
                          MappingProxyType(dict(state.belief)), self.tick_index)
 
     def step(self) -> dict:
         tick = self.tick_index
+        forwards_before = self._forward_count
         self._deliver(tick)
         self._advance(tick)
         self._start(tick)
@@ -112,14 +113,23 @@ class Simulator:
             view = self.local_view(node_id, task_id)
             action = self.rule.decide(self._tasks[task_id], view)
             decisions.append((node_id, task_id, action))
+            target = action.target_node if isinstance(action, Forward) else None
+            actual_gain = None
+            if target in self._nodes:
+                source_state = self._nodes[node_id]
+                target_state = self._nodes[target]
+                actual_gain = quadratic_gain(self._remaining(source_state), source_state.hardware.cpu_rate,
+                                             self._remaining(target_state), target_state.hardware.cpu_rate,
+                                             self._tasks[task_id].remaining_work)
             self._decisions.append({"node_id": node_id, "task_id": task_id,
                                     "action": type(action).__name__.lower(),
-                                    "target_node": action.target_node if isinstance(action, Forward) else None})
+                                    "target_node": target, "actual_gain": actual_gain})
         for node_id, task_id, action in decisions:
             self._apply(node_id, task_id, action, tick)
         self._generate(tick)
         self._schedule_gossip(tick)
         shot = self.snapshot(tick)
+        shot["diagnostics"]["forwarded_this_tick"] = self._forward_count - forwards_before
         self.tick_index += 1
         return shot
 
@@ -200,6 +210,7 @@ class Simulator:
                                             source=node_id, target=action.target_node,
                                             depart_tick=tick, arrive_tick=arrive, hops=task.hops + 1)
             self._task_transits.append(TaskTransit(task_id, node_id, action.target_node, tick, arrive))
+            self._forward_count += 1
             self._report(state, tick)
             return
         raise TypeError(f"unknown action: {action!r}")
@@ -207,17 +218,19 @@ class Simulator:
     def _generate(self, tick: int) -> None:
         w = self.scenario.workload
         ids = tuple(self._nodes)
-        maximum = min(w.memory_required_range[1], int(max(n.hardware.memory_capacity for n in self._nodes.values())))
         for _ in range(w.arrival_attempts):
             if self.rng.random() >= w.arrival_probability:
                 continue
             origin = self.rng.choice(ids)
             work = self.rng.randint(*w.compute_work_range)
+            state = self._nodes[origin]
+            local_capacity = max([state.hardware.memory_capacity] +
+                                 [self._nodes[peer].hardware.memory_capacity for peer in state.hardware.neighbors])
+            maximum = min(w.memory_required_range[1], int(local_capacity))
             memory = self.rng.randint(w.memory_required_range[0], maximum)
             task_id = f"T{self._next_task:04d}"
             self._next_task += 1
             self._tasks[task_id] = Task(task_id, origin, tick, work, work, memory, current_node=origin)
-            state = self._nodes[origin]
             state.pending.append(task_id)
             self._report(state, tick)
 
@@ -239,10 +252,22 @@ class Simulator:
             nodes[node_id] = {**asdict(state.hardware), "remaining_work": self._remaining(state),
                               "pending": tuple(state.pending), "runnable": tuple(state.runnable),
                               "running": state.running}
+        pressures = [node["remaining_work"] / node["cpu_rate"] for node in nodes.values()]
+        diagnostics = {
+            "phi": sum(node["remaining_work"]**2 / (2 * node["cpu_rate"]) for node in nodes.values()),
+            "total_remaining_work": sum(task.remaining_work for task in self._tasks.values()
+                                        if task.status != "completed"),
+            "completed_count": sum(task.status == "completed" for task in self._tasks.values()),
+            "mean_pressure": sum(pressures) / len(pressures),
+            "max_pressure": max(pressures),
+            "forwarded_count": self._forward_count,
+            "forwarded_this_tick": 0,
+        }
         return {"tick": tick, "nodes": nodes,
                 "tasks": {key: asdict(task) for key, task in self._tasks.items()},
                 "beliefs": {node_id: {key: asdict(record) for key, record in state.belief.items()}
                             for node_id, state in self._nodes.items()},
                 "task_transits": [asdict(t) for t in self._task_transits],
                 "gossip_messages": [asdict(m) for m in self._gossip_messages],
-                "decisions": [dict(decision) for decision in self._decisions]}
+                "decisions": [dict(decision) for decision in self._decisions],
+                "diagnostics": diagnostics}
