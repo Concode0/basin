@@ -1,37 +1,32 @@
 # Basin
 
-Basin is a small deterministic sandbox for studying decentralized scheduling under heterogeneous resources and delayed local knowledge. It asks whether heterogeneous nodes can distribute randomly arriving work through local decisions and delayed gossip.
+A small experiment: can sparse, heterogeneous nodes spread randomly arriving work toward a moving balance using only local decisions and delayed gossip?
 
-## Run
+## Setup
+
+Twenty fixed nodes have different CPU rates and memory capacities. Each has three graph neighbors. Tasks arrive at random origins with random compute work and memory needs; every task fits its origin or a direct neighbor. One worker per node consumes `cpu_rate` units of work per tick. Nodes know their own work exactly, while versioned reports from neighbors arrive after three ticks and can be lost.
+
+## Rule
+
+A node's pressure is `p_i = W_i / c_i`, where `W_i` is its queued and running work and `c_i` is its CPU rate. The experiment tracks `Phi = sum(W_i² / (2 c_i))`. For a pending task of work `w`, the node estimates how moving it to each memory-feasible direct neighbor would change its two-node contribution to `Phi`. It forwards to the neighbor with the largest positive decrease; otherwise it accepts the task locally. An origin that cannot execute the task waits if no positive feasible move is known yet. A hop limit is the final safety bound. The rule sees exact local work and gossiped neighbor records, never global truth.
+
+## What I observed
+
+With 19 initially imbalanced tasks and no later arrivals, refreshing neighbor records just before decisions gave 53 forwards in 180 ticks; every move had positive true quadratic gain (smallest `+7.95`). By tick 24, placement had settled with work still running and no positive feasible one-hop move among the remaining runnable tasks. With the normal three-tick gossip delay and 4% packet loss, the same initial workload made 35 forwards. One had negative true gain (`-156.6` at tick 10); that task moved again as information changed. The snapshot potential can also jump when work in transit arrives, since `W_i` counts only queued and running work. Per-move gain is the direct check of the rule's energy condition.
+
+The default arrival rate offers about 54 work units per tick against 82.3 units of aggregate CPU capacity, about 66%. In a 5,000-tick seed-7 run, mean outstanding work over successive 500-tick windows ranged from 850 to 1,212 units and ended at 927. It fluctuated rather than draining or rising steadily. This is a local, dynamic balance, not a guaranteed global optimum: tasks are indivisible, edges are sparse, memory is only a hard constraint, and gossip is delayed.
+
+## Visualization
+
+The Matplotlib map fixes each node at `(cpu_rate, memory_capacity)` and colors its sampled pressure. Contours interpolate those discrete samples for viewing only; the field and geometric distances never affect routing. Edges show communication links, while task and gossip markers move along their actual transits. Playback uses discrete simulation snapshots with smooth visual transit positions. Click nodes to inspect beliefs and tasks to inspect projected pressure. [View a 100-tick GIF](basin.gif).
+
+## Running
 
 ```bash
 uv sync
 uv run python -m basin
-uv run python -m basin --ticks 300 --seed 7
 uv run python -m basin --ticks 300 --seed 7 --gif basin.gif
-uv run python -m basin --ticks 300 --seed 7 --gif basin.gif --gif-only
-```
-
-The command precomputes snapshots and opens one interactive Matplotlib figure. Playback uses a 350 ms simulation tick and about 20 visual frames per second; only in-flight marker positions move between snapshots. Use Play/Pause, Prev/Next, or the slider to inspect discrete frames. Left/Right and Space also work. Click a node to show its belief; click it again for global truth. Click an active task for its task-specific projected pressure; click again to clear. Escape clears both selections. `--gif` exports through Matplotlib and Pillow before opening the viewer; `--fps` changes visual playback and export rate. Python code can call `basin.viewer.save_gif(frames, path, fps=20)` directly.
-
-## Experiment
-
-Nodes are fixed heterogeneous machines with a CPU rate, memory capacity, and communication neighbors. A node has one worker slot. Seeded random arrivals choose an origin, compute work, and memory requirement. Every generated task fits at least one machine, though its origin may be infeasible. A running task loses `cpu_rate` units of remaining work per tick. Memory is a hard feasibility constraint, not a changing coordinate or shared allocation model.
-
-Each tick delivers due messages and task transits, advances running work, starts one runnable task per idle node, lets each node decide on at most one pending task, applies forwarding, injects arrivals, schedules gossip, and stores a detached snapshot. New tasks therefore appear before their first placement decision. Forwarded tasks and gossip travel for multiple ticks. Versioned state reports move over graph edges, with optional seeded packet loss. A node always knows its own work exactly, while remote reports can be old or unknown.
-
-`Rule.decide(task, LocalView)` receives a frozen task and only local state, neighbor IDs, and local belief records. The initial `BasinRule` filters infeasible candidates, compares `(known_remaining_work + task.compute_work) / cpu_rate`, and forwards only when a known neighbor improves projected pressure by more than a small hysteresis. An infeasible origin forwards to a known feasible neighbor when possible. A hop limit bounds routing. This is a baseline rule to replace and test, not a claim of a novel scheduler.
-
-## Map
-
-Every node stays at `(cpu_rate, memory_capacity)`. Thin lines show actual communication edges; geometric length has no latency meaning. The ordinary potential map interpolates discrete `remaining_work / cpu_rate` samples using one stable color range across the replay. Selecting a task shows projected pressure and marks memory-infeasible nodes with X markers. Selecting a node reconstructs the same map from that node's current belief, leaving unknown nodes hollow. Yellow markers show tasks; orange marks running work; small blue markers show in-flight gossip. Transit positions come directly from departure, fractional display time, and arrival ticks. Pressure, beliefs, queues, and task lifecycle change only at snapshot boundaries.
-
-The interpolated field is a human visualization of discrete node costs. It is not part of routing semantics or a physical simulation. Scheduling uses graph neighbors and belief records only. The useful observations are stale decisions, oscillations, queue growth, and imbalance as information catches up.
-
-## Tests
-
-```bash
 uv run python -m unittest discover -s tests -v
 ```
 
-The repository has no server, browser viewer, or web replay layer. Git history retains the previous implementations.
+Use `--gif-only` to export without opening the viewer, or `--fps` to change visual playback and GIF rate. Code can call `basin.viewer.save_gif(frames, path, fps=20)` directly.
